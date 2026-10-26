@@ -2,19 +2,21 @@
 # I frequently have to determine which ordered mutant is found in which well of our ordered mutant library. The following takes output files from Effie's pipeline and assigns the most likely mutant
 
 # cd /uufs/chpc.utah.edu/common/home/karasov-group1/lab_members/esymeonidi/charact_sep26/final_comparison/dc3000
-"""
-Assign barcodes to plate x well coordinates from combinatorial pools.
 
-Reads:
+"""
+Assign each barcode to its original plate x well coordinate.
+
+Input:
   dc3000_plate001_top_ids.txt ... dc3000_plate025_top_ids.txt
   dc3000_all_positions.txt
 
-The script:
-  1. Calls a barcode's plate from the 25 plate pools.
-  2. Calls its well from the 96 position pools.
-  3. Corrects position-pool barcodes that are one base away from a
-     uniquely matching, well-supported barcode in the plate pools.
-  4. Reports confident, ambiguous, and incomplete calls.
+Logic:
+  - Take the top 96 barcodes from each of the 25 plate pools:
+      25 plates x 96 wells = 2,400 expected mutants.
+  - Use these as the true-barcode whitelist.
+  - Aggregate position-pool data by well (A01-H12).
+  - Correct unique one-base barcode variants to the whitelist barcode.
+  - Call the best plate and well for each barcode.
 """
 
 import argparse
@@ -25,13 +27,12 @@ from pathlib import Path
 
 PLATE_FILE_RE = re.compile(r"plate(\d+)_top_ids\.txt$", re.IGNORECASE)
 COUNT_RE = re.compile(r":(\d+)$")
-# Matches A01P02id01, H12P25id60, or A01id01
 POSITION_RE = re.compile(r"^([A-H]\d{2})(?:P\d+)?id\d+$", re.IGNORECASE)
 BASES = "ACGT"
 
 
 def parse_line(line, source):
-    """Return (pool_name, count, barcode); return None for blank lines."""
+    """Return (pool_name, count, barcode), or None for blank lines."""
     fields = line.strip().split()
 
     if not fields:
@@ -41,8 +42,8 @@ def parse_line(line, source):
         raise ValueError(f"Unexpected line in {source}: {line.rstrip()}")
 
     label, barcode = fields
-
     count_match = COUNT_RE.search(label)
+
     if not count_match:
         raise ValueError(
             f"Could not parse ':count' from {source}: {line.rstrip()}"
@@ -56,11 +57,14 @@ def parse_line(line, source):
 
 def make_one_error_lookup(valid_barcodes):
     """
-    For each valid barcode, generate all one-substitution neighbors.
+    Make a lookup table of all one-base substitutions.
 
-    Returns:
-        dict:
-          erroneous sequence -> set of possible true parent barcode(s)
+    Example:
+      true barcode = ACGT
+      possible observed one-base variants = CCGT, GCGT, TCGT, AAGT, etc.
+
+    The value is a set because a variant could theoretically be one base
+    away from more than one true barcode.
     """
     lookup = defaultdict(set)
 
@@ -68,10 +72,10 @@ def make_one_error_lookup(valid_barcodes):
         for i, original_base in enumerate(barcode):
             for new_base in BASES:
                 if new_base != original_base:
-                    neighbor = (
+                    variant = (
                         barcode[:i] + new_base + barcode[i + 1:]
                     )
-                    lookup[neighbor].add(barcode)
+                    lookup[variant].add(barcode)
 
     return lookup
 
@@ -81,9 +85,9 @@ def rank_scores(scores):
     Given {coordinate: read_count}, return:
       best_coordinate, best_count,
       second_coordinate, second_count,
-      best/second ratio
+      top/second ratio
     """
-    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    ranked = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
 
     if not ranked:
         return "NA", 0, "NA", 0, "NA"
@@ -103,18 +107,12 @@ def rank_scores(scores):
     return best_name, best_count, second_name, second_count, ratio
 
 
-def ratio_is_confident(ratio, cutoff):
-    """Return True if the top call exceeds the chosen confidence cutoff."""
+def is_confident(ratio, cutoff):
     return ratio == "inf" or ratio >= cutoff
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Match barcodes to plate x well coordinates, with "
-            "one-base barcode error correction."
-        )
-    )
+    parser = argparse.ArgumentParser()
 
     parser.add_argument(
         "--directory",
@@ -130,38 +128,29 @@ def main():
 
     parser.add_argument(
         "--output",
-        default="barcode_plate_well_errorcorrected.tsv",
+        default="barcode_plate_well_assignments.tsv",
         help="Output TSV filename.",
     )
 
     parser.add_argument(
-        "--min-whitelist-reads",
+        "--barcodes-per-plate",
         type=int,
-        default=250,
-        help=(
-            "Minimum summed plate-pool reads for a barcode to be used "
-            "as a true barcode for one-base error correction [default: 250]."
-        ),
+        default=96,
+        help="Number of expected true barcodes per plate [default: 96].",
     )
 
     parser.add_argument(
         "--min-plate-ratio",
         type=float,
         default=1.25,
-        help=(
-            "Minimum top/second plate-count ratio for a confident plate call "
-            "[default: 1.25]."
-        ),
+        help="Top/second plate-count ratio for confident calls [default: 1.25].",
     )
 
     parser.add_argument(
         "--min-well-ratio",
         type=float,
         default=1.25,
-        help=(
-            "Minimum top/second well-count ratio for a confident well call "
-            "[default: 1.25]."
-        ),
+        help="Top/second well-count ratio for confident calls [default: 1.25].",
     )
 
     args = parser.parse_args()
@@ -191,13 +180,17 @@ def main():
             "No files matching '*plate*_top_ids.txt' were found."
         )
 
-    # barcode -> {plate: total count}
+    print(f"Reading {len(plate_files)} plate-pool files.")
+
+    # barcode -> {plate: total reads}
     plate_counts = defaultdict(lambda: defaultdict(int))
 
-    print(f"Reading {len(plate_files)} plate-pool files.")
+    # plate -> the top 96 expected barcode sequences for that plate
+    top_barcodes_by_plate = {}
 
     for plate_number, path in plate_files:
         plate = f"plate{plate_number:03d}"
+        top_barcodes = []
 
         with path.open() as handle:
             for line in handle:
@@ -209,22 +202,43 @@ def main():
                 _, count, barcode = parsed
                 plate_counts[barcode][plate] += count
 
-    # Only well-supported plate-pool barcodes can be parents for correcting
-    # sequencing/PCR variants in the position pools.
-    valid_barcodes = {
-        barcode
-        for barcode, counts in plate_counts.items()
-        if sum(counts.values()) >= args.min_whitelist_reads
-    }
+                # Files are already in descending rank order: id001, id002, etc.
+                if len(top_barcodes) < args.barcodes_per_plate:
+                    top_barcodes.append(barcode)
+
+        top_barcodes_by_plate[plate] = top_barcodes
+
+        if len(top_barcodes) < args.barcodes_per_plate:
+            print(
+                f"WARNING: {plate} contained only {len(top_barcodes)} "
+                f"barcodes, not {args.barcodes_per_plate}."
+            )
+
+    # The true mutant-barcode whitelist:
+    # top 96 calls from each of 25 plates = expected 2,400 mutants.
+    valid_barcodes = set()
+
+    for plate, barcodes in top_barcodes_by_plate.items():
+        valid_barcodes.update(barcodes)
+
+    expected_total = len(plate_files) * args.barcodes_per_plate
+
+    print(
+        f"Expected barcode entries: {expected_total} "
+        f"({len(plate_files)} plates x {args.barcodes_per_plate})."
+    )
+    print(f"Unique whitelist barcodes: {len(valid_barcodes)}.")
+
+    if len(valid_barcodes) < expected_total:
+        print(
+            "WARNING: fewer unique whitelist barcodes than expected. "
+            "This means at least one barcode appeared among the top calls "
+            "for more than one plate."
+        )
 
     one_error_lookup = make_one_error_lookup(valid_barcodes)
 
-    print(
-        f"Plate-barcode whitelist: {len(valid_barcodes)} barcodes "
-        f"(minimum {args.min_whitelist_reads} reads)."
-    )
-
-    # barcode -> {well: total count}
+    # barcode -> {well: total reads}
     well_counts = defaultdict(lambda: defaultdict(int))
 
     exact_position_reads = 0
@@ -250,27 +264,26 @@ def main():
                 unknown_position_labels.add(raw_pool)
                 continue
 
-            # For example, A01P02id01 is assigned to well A01.
+            # A label such as A01P02id01 is assigned to well A01.
             well = position_match.group(1).upper()
 
-            # Exact barcode call.
+            # Exact match to a true barcode.
             if observed_barcode in valid_barcodes:
                 barcode = observed_barcode
                 exact_position_reads += count
 
-            # Correct a unique one-base sequence variant.
             else:
                 possible_parents = one_error_lookup.get(
                     observed_barcode,
                     set()
                 )
 
+                # Correct only if this variant has one unambiguous parent.
                 if len(possible_parents) == 1:
                     barcode = next(iter(possible_parents))
                     corrected_position_reads += count
 
                 elif len(possible_parents) > 1:
-                    # Do not arbitrarily choose between two possible parents.
                     ambiguous_error_reads += count
                     continue
 
@@ -287,10 +300,6 @@ def main():
             f"WARNING: skipped {len(unknown_position_labels)} "
             f"unrecognized position labels. Examples: {examples}"
         )
-
-    # Report only plate-supported barcode identities, rather than treating
-    # low-count sequence errors as independent mutants.
-    barcodes_to_report = sorted(valid_barcodes)
 
     confident = 0
     incomplete = 0
@@ -314,7 +323,7 @@ def main():
             "status",
         ])
 
-        for barcode in barcodes_to_report:
+        for barcode in sorted(valid_barcodes):
             (
                 plate,
                 plate_count,
@@ -336,29 +345,21 @@ def main():
             if plate == "NA":
                 flags.append("missing_plate")
 
-            elif not ratio_is_confident(
-                plate_ratio,
-                args.min_plate_ratio,
-            ):
+            elif not is_confident(plate_ratio, args.min_plate_ratio):
                 flags.append("ambiguous_plate")
 
             if well == "NA":
                 flags.append("missing_well")
 
-            elif not ratio_is_confident(
-                well_ratio,
-                args.min_well_ratio,
-            ):
+            elif not is_confident(well_ratio, args.min_well_ratio):
                 flags.append("ambiguous_well")
 
             status = "confident" if not flags else ";".join(flags)
 
             if status == "confident":
                 confident += 1
-
             elif "missing_" in status:
                 incomplete += 1
-
             else:
                 ambiguous += 1
 
@@ -379,18 +380,14 @@ def main():
 
     print("\nPosition-pool read handling:")
     print(f"  exact whitelist barcode reads: {exact_position_reads}")
+    print(f"  corrected one-base variant reads: {corrected_position_reads}")
     print(
-        f"  corrected one-base variant reads: "
-        f"{corrected_position_reads}"
-    )
-    print(
-        f"  ambiguous one-base variant reads skipped: "
-        f"{ambiguous_error_reads}"
+        f"  ambiguous one-base variants skipped: {ambiguous_error_reads}"
     )
     print(f"  unmatched reads skipped: {unmatched_position_reads}")
 
     print(f"\nWrote: {output_file}")
-    print(f"Whitelist barcodes assessed: {len(barcodes_to_report)}")
+    print(f"Whitelist barcodes assessed: {len(valid_barcodes)}")
     print(f"Confident assignments: {confident}")
     print(f"Incomplete assignments: {incomplete}")
     print(f"Ambiguous assignments: {ambiguous}")
