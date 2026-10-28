@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # I frequently have to determine which ordered mutant is found in which well of our ordered mutant library. The following takes output files from Effie's pipeline and assigns the most likely mutant
 
-# cd /uufs/chpc.utah.edu/common/home/karasov-group1/lab_members/esymeonidi/charact_sep26/final_comparison/dc3000
+# cd /uufs/chpc.utah.edu/common/home/karasov-group1/lab_members/esymeonidi/charact_sep26/final_comparison_200/dc3000
 
 """Assign barcodes to plate x well coordinates from combinatorial pools.
 
